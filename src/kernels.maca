@@ -1,7 +1,480 @@
 #include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+#include <cmath>
+
 #include <common/maca_fp16.h>
 
 #include "../tester/utils.h"
+
+namespace {
+
+// ================================
+// MACA Port from CUDA Implementation
+// ================================
+// Ported from NVIDIA CUDA to MACA compute architecture.
+// Key differences:
+// - Runtime API: cudaMalloc -> mcMalloc, cudaMemcpy -> mcMemcpy, etc.
+// - Headers: cuda_fp16.h -> common/maca_fp16.h
+// - Kernel syntax and intrinsics should be compatible
+
+template <typename T>
+struct AccType;
+
+template <>
+struct AccType<int> {
+  using type = int64_t;
+};
+
+template <>
+struct AccType<float> {
+  using type = float;
+};
+
+template <>
+struct AccType<half> {
+  using type = float;
+};
+
+// Type conversion utilities
+__device__ __forceinline__ float to_float(float x) { return x; }
+__device__ __forceinline__ float to_float(half x) { return __half2float(x); }
+__device__ __forceinline__ half from_float_to_half(float x) { return __float2half_rn(x); }
+
+// Atomic add for accumulator types
+__device__ __forceinline__ void atomicAddAcc(float* addr, float v) { atomicAdd(addr, v); }
+__device__ __forceinline__ void atomicAddAcc(int64_t* addr, int64_t v) {
+  atomicAdd(reinterpret_cast<unsigned long long*>(addr), static_cast<unsigned long long>(v));
+}
+
+// ================================
+// Trace Kernel
+// ================================
+template <typename T>
+__global__ void traceKernel(const T* __restrict__ input, size_t cols, size_t n,
+                            typename AccType<T>::type* __restrict__ out) {
+  using Acc = typename AccType<T>::type;
+  Acc local = 0;
+  for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += static_cast<size_t>(gridDim.x) * blockDim.x) {
+    const size_t idx = i * cols + i;
+    if constexpr (std::is_same_v<T, int>) {
+      local += static_cast<Acc>(input[idx]);
+    } else {
+      local += static_cast<Acc>(to_float(input[idx]));
+    }
+  }
+
+  __shared__ Acc sdata[256];
+  const int tid = threadIdx.x;
+  sdata[tid] = local;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      sdata[tid] += sdata[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    atomicAddAcc(out, sdata[0]);
+  }
+}
+
+// ================================
+// Flash Attention Kernel (Online Softmax)
+// ================================
+template <typename T>
+__global__ void flashAttentionKernel(const T* __restrict__ q, const T* __restrict__ k,
+                                     const T* __restrict__ v, T* __restrict__ o,
+                                     int batch_size, int target_seq_len, int src_seq_len,
+                                     int query_heads, int kv_heads, int head_dim,
+                                     bool is_causal, float scale) {
+  const int q_head = static_cast<int>(blockIdx.x);
+  const int t = static_cast<int>(blockIdx.y);
+  const int b = static_cast<int>(blockIdx.z);
+
+  if (b >= batch_size || t >= target_seq_len || q_head >= query_heads) {
+    return;
+  }
+
+  // GQA head mapping
+  const int kv_head = (kv_heads > 0 && query_heads > 0)
+                          ? static_cast<int>((static_cast<int64_t>(q_head) * kv_heads) / query_heads)
+                          : 0;
+  if (kv_head >= kv_heads) {
+    return;
+  }
+
+  const int tid = threadIdx.x;
+
+  // Online softmax state (shared scalars)
+  __shared__ float sh_m;
+  __shared__ float sh_l;
+  __shared__ float sh_alpha;
+  __shared__ float sh_beta;
+
+  // Dynamic shared memory layout
+  extern __shared__ float shmem[];
+  float* red = shmem;
+  float* ovec = shmem + blockDim.x;
+
+  if (tid == 0) {
+    sh_m = -INFINITY;
+    sh_l = 0.0f;
+  }
+  __syncthreads();
+
+  for (int di = tid; di < head_dim; di += blockDim.x) {
+    ovec[di] = 0.0f;
+  }
+  __syncthreads();
+
+  const int q_base = (((b * target_seq_len + t) * query_heads + q_head) * head_dim);
+
+  for (int s = 0; s < src_seq_len; ++s) {
+    const bool masked = is_causal && (s > t);
+
+    float dot = 0.0f;
+    if (!masked) {
+      const int k_base = (((b * src_seq_len + s) * kv_heads + kv_head) * head_dim);
+      for (int di = tid; di < head_dim; di += blockDim.x) {
+        dot = fmaf(to_float(q[q_base + di]), to_float(k[k_base + di]), dot);
+      }
+    }
+
+    red[tid] = dot;
+    __syncthreads();
+
+    // Reduce within block
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        red[tid] += red[tid + stride];
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      const float score = masked ? -INFINITY : (red[0] * scale);
+      const float m_old = sh_m;
+      const float l_old = sh_l;
+
+      const float m_new = fmaxf(m_old, score);
+      float alpha = 0.0f;
+      float beta = 0.0f;
+      float l_new = 0.0f;
+      if (m_new != -INFINITY) {
+        alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+        beta = (score == -INFINITY) ? 0.0f : expf(score - m_new);
+        l_new = l_old * alpha + beta;
+      }
+
+      sh_m = m_new;
+      sh_l = l_new;
+      sh_alpha = alpha;
+      sh_beta = beta;
+    }
+    __syncthreads();
+
+    // Update output accumulator
+    if (sh_beta != 0.0f || sh_alpha != 1.0f) {
+      const float alpha = sh_alpha;
+      const float beta = sh_beta;
+      if (beta != 0.0f) {
+        const int v_base = (((b * src_seq_len + s) * kv_heads + kv_head) * head_dim);
+        for (int di = tid; di < head_dim; di += blockDim.x) {
+          ovec[di] = ovec[di] * alpha + beta * to_float(v[v_base + di]);
+        }
+      } else {
+        for (int di = tid; di < head_dim; di += blockDim.x) {
+          ovec[di] = ovec[di] * alpha;
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  const float inv_l = (sh_l == 0.0f) ? 0.0f : (1.0f / sh_l);
+  for (int di = tid; di < head_dim; di += blockDim.x) {
+    const float out_f = ovec[di] * inv_l;
+    const int o_idx = q_base + di;
+    if constexpr (std::is_same_v<T, half>) {
+      o[o_idx] = from_float_to_half(out_f);
+    } else {
+      o[o_idx] = static_cast<T>(out_f);
+    }
+  }
+}
+
+// ================================
+// Float Two-Pass Softmax Kernel
+// ================================
+__global__ void flashAttentionKernelFloatTwoPass(const float* __restrict__ q, const float* __restrict__ k,
+                                                 const float* __restrict__ v, float* __restrict__ o,
+                                                 int batch_size, int target_seq_len, int src_seq_len,
+                                                 int query_heads, int kv_heads, int head_dim,
+                                                 bool is_causal, float scale) {
+  const int q_head = static_cast<int>(blockIdx.x);
+  const int t = static_cast<int>(blockIdx.y);
+  const int b = static_cast<int>(blockIdx.z);
+
+  if (b >= batch_size || t >= target_seq_len || q_head >= query_heads) {
+    return;
+  }
+
+  const int kv_head = (kv_heads > 0 && query_heads > 0)
+                          ? static_cast<int>((static_cast<int64_t>(q_head) * kv_heads) / query_heads)
+                          : 0;
+  if (kv_head >= kv_heads) {
+    return;
+  }
+
+  const int tid = threadIdx.x;
+
+  __shared__ float sh_max;
+  __shared__ float sh_l;
+  __shared__ float sh_w;
+
+  extern __shared__ float shmem[];
+  float* red = shmem;
+  float* ovec = shmem + blockDim.x;
+
+  if (tid == 0) {
+    sh_max = -INFINITY;
+  }
+  __syncthreads();
+
+  const int q_base = (((b * target_seq_len + t) * query_heads + q_head) * head_dim);
+
+  // Pass 1: Find max score
+  for (int s = 0; s < src_seq_len; ++s) {
+    const bool masked = is_causal && (s > t);
+    // Use Kahan summation for better precision
+    float dot = 0.0f;
+    float c = 0.0f;  // Compensation for lost low-order bits
+    if (!masked) {
+      const int k_base = (((b * src_seq_len + s) * kv_heads + kv_head) * head_dim);
+      for (int di = tid; di < head_dim; di += blockDim.x) {
+        float prod = q[q_base + di] * k[k_base + di];
+        float y = prod - c;
+        float t_sum = dot + y;
+        c = (t_sum - dot) - y;
+        dot = t_sum;
+      }
+    }
+
+    red[tid] = dot;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        red[tid] += red[tid + stride];
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      const float score = masked ? -INFINITY : (red[0] * scale);
+      sh_max = fmaxf(sh_max, score);
+    }
+    __syncthreads();
+  }
+
+  // Initialize accumulator
+  for (int di = tid; di < head_dim; di += blockDim.x) {
+    ovec[di] = 0.0f;
+  }
+  if (tid == 0) {
+    sh_l = 0.0f;
+  }
+  __syncthreads();
+
+  // Pass 2: sumexp + output accumulation
+  for (int s = 0; s < src_seq_len; ++s) {
+    const bool masked = is_causal && (s > t);
+    // Use Kahan summation for better precision
+    float dot = 0.0f;
+    float c = 0.0f;  // Compensation for lost low-order bits
+    if (!masked) {
+      const int k_base = (((b * src_seq_len + s) * kv_heads + kv_head) * head_dim);
+      for (int di = tid; di < head_dim; di += blockDim.x) {
+        float prod = q[q_base + di] * k[k_base + di];
+        float y = prod - c;
+        float t_sum = dot + y;
+        c = (t_sum - dot) - y;
+        dot = t_sum;
+      }
+    }
+
+    red[tid] = dot;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        red[tid] += red[tid + stride];
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      const float score = masked ? -INFINITY : (red[0] * scale);
+      const float w = (score == -INFINITY || sh_max == -INFINITY) ? 0.0f : __expf(score - sh_max);
+      sh_w = w;
+      sh_l += w;
+    }
+    __syncthreads();
+
+    const float w = sh_w;
+    if (w != 0.0f) {
+      const int v_base = (((b * src_seq_len + s) * kv_heads + kv_head) * head_dim);
+      for (int di = tid; di < head_dim; di += blockDim.x) {
+        ovec[di] += w * v[v_base + di];
+      }
+    }
+    __syncthreads();
+  }
+
+  const float inv_l = (sh_l == 0.0f) ? 0.0f : (1.0f / sh_l);
+  for (int di = tid; di < head_dim; di += blockDim.x) {
+    o[q_base + di] = ovec[di] * inv_l;
+  }
+}
+
+// ================================
+// Float Two-Pass with Double Accumulation
+// ================================
+__global__ void flashAttentionKernelFloatTwoPassAcc(const float* __restrict__ q, const float* __restrict__ k,
+                                                    const float* __restrict__ v, float* __restrict__ o,
+                                                    int batch_size, int target_seq_len, int src_seq_len,
+                                                    int query_heads, int kv_heads, int head_dim,
+                                                    bool is_causal, double scale) {
+  const int q_head = static_cast<int>(blockIdx.x);
+  const int t = static_cast<int>(blockIdx.y);
+  const int b = static_cast<int>(blockIdx.z);
+
+  if (b >= batch_size || t >= target_seq_len || q_head >= query_heads) {
+    return;
+  }
+
+  const int kv_head = (kv_heads > 0 && query_heads > 0)
+                          ? static_cast<int>((static_cast<int64_t>(q_head) * kv_heads) / query_heads)
+                          : 0;
+  if (kv_head >= kv_heads) {
+    return;
+  }
+
+  const int tid = threadIdx.x;
+
+  __shared__ double sh_max;
+  __shared__ double sh_l;
+  __shared__ double sh_w;
+
+  extern __shared__ double shmem_d[];
+  double* red = shmem_d;
+  double* ovec = shmem_d + blockDim.x;
+
+  if (tid == 0) {
+    sh_max = -INFINITY;
+  }
+  __syncthreads();
+
+  const int q_base = (((b * target_seq_len + t) * query_heads + q_head) * head_dim);
+
+  // Pass 1: max
+  for (int s = 0; s < src_seq_len; ++s) {
+    const bool masked = is_causal && (s > t);
+    // Use Kahan summation for maximum precision
+    double dot = 0.0;
+    double c = 0.0;
+    if (!masked) {
+      const int k_base = (((b * src_seq_len + s) * kv_heads + kv_head) * head_dim);
+      for (int di = tid; di < head_dim; di += blockDim.x) {
+        double prod = static_cast<double>(q[q_base + di]) * static_cast<double>(k[k_base + di]);
+        double y = prod - c;
+        double t_sum = dot + y;
+        c = (t_sum - dot) - y;
+        dot = t_sum;
+      }
+    }
+
+    red[tid] = dot;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        red[tid] += red[tid + stride];
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      const double score = masked ? -INFINITY : (red[0] * scale);
+      sh_max = fmax(sh_max, score);
+    }
+    __syncthreads();
+  }
+
+  // init
+  for (int di = tid; di < head_dim; di += blockDim.x) {
+    ovec[di] = 0.0;
+  }
+  if (tid == 0) {
+    sh_l = 0.0;
+  }
+  __syncthreads();
+
+  // Pass 2: sumexp + output
+  for (int s = 0; s < src_seq_len; ++s) {
+    const bool masked = is_causal && (s > t);
+    // Use Kahan summation for maximum precision
+    double dot = 0.0;
+    double c = 0.0;
+    if (!masked) {
+      const int k_base = (((b * src_seq_len + s) * kv_heads + kv_head) * head_dim);
+      for (int di = tid; di < head_dim; di += blockDim.x) {
+        double prod = static_cast<double>(q[q_base + di]) * static_cast<double>(k[k_base + di]);
+        double y = prod - c;
+        double t_sum = dot + y;
+        c = (t_sum - dot) - y;
+        dot = t_sum;
+      }
+    }
+
+    red[tid] = dot;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (tid < stride) {
+        red[tid] += red[tid + stride];
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      const double score = masked ? -INFINITY : (red[0] * scale);
+      const double w = (score == -INFINITY || sh_max == -INFINITY) ? 0.0 : exp(score - sh_max);
+      sh_w = w;
+      sh_l += w;
+    }
+    __syncthreads();
+
+    const double w = sh_w;
+    if (w != 0.0) {
+      const int v_base = (((b * src_seq_len + s) * kv_heads + kv_head) * head_dim);
+      for (int di = tid; di < head_dim; di += blockDim.x) {
+        ovec[di] += w * static_cast<double>(v[v_base + di]);
+      }
+    }
+    __syncthreads();
+  }
+
+  const double inv_l = (sh_l == 0.0) ? 0.0 : (1.0 / sh_l);
+  for (int di = tid; di < head_dim; di += blockDim.x) {
+    o[q_base + di] = static_cast<float>(ovec[di] * inv_l);
+  }
+}
+
+inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
+
+} // namespace
 
 /**
  * @brief Computes the trace of a matrix.
@@ -19,8 +492,38 @@
  */
 template <typename T>
 T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+  using Acc = typename AccType<T>::type;
+
+  const size_t n = (rows < cols) ? rows : cols;
+  if (n == 0) {
+    return T(0);
+  }
+
+  T* d_input = nullptr;
+  Acc* d_out = nullptr;
+
+  RUNTIME_CHECK(mcMalloc(&d_input, sizeof(T) * h_input.size()));
+  RUNTIME_CHECK(mcMemcpy(d_input, h_input.data(), sizeof(T) * h_input.size(), mcMemcpyHostToDevice));
+  RUNTIME_CHECK(mcMalloc(&d_out, sizeof(Acc)));
+  RUNTIME_CHECK(mcMemset(d_out, 0, sizeof(Acc)));
+
+  const int threads = 256;
+  const int blocks = static_cast<int>(n < 4096 ? ceil_div(static_cast<int>(n), threads) : 1024);
+  traceKernel<T><<<blocks, threads>>>(d_input, cols, n, d_out);
+  RUNTIME_CHECK(mcGetLastError());
+  RUNTIME_CHECK(mcDeviceSynchronize());
+
+  Acc h_out{};
+  RUNTIME_CHECK(mcMemcpy(&h_out, d_out, sizeof(Acc), mcMemcpyDeviceToHost));
+
+  RUNTIME_CHECK(mcFree(d_input));
+  RUNTIME_CHECK(mcFree(d_out));
+
+  if constexpr (std::is_same_v<T, int>) {
+    return static_cast<int>(h_out);
+  } else {
+    return static_cast<T>(h_out);
+  }
 }
 
 /**
@@ -44,6 +547,78 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
                     const std::vector<T>& h_v, std::vector<T>& h_o,
                     int batch_size, int target_seq_len, int src_seq_len, 
                     int query_heads, int kv_heads, int head_dim, bool is_causal) {       
+  const size_t q_elems = static_cast<size_t>(batch_size) * target_seq_len * query_heads * head_dim;
+  const size_t kv_elems = static_cast<size_t>(batch_size) * src_seq_len * kv_heads * head_dim;
+
+  if (q_elems == 0 || kv_elems == 0) {
+    h_o.assign(q_elems, T(0));
+    return;
+  }
+
+  if (h_o.size() != q_elems) {
+    h_o.resize(q_elems);
+  }
+
+  T* d_q = nullptr;
+  T* d_k = nullptr;
+  T* d_v = nullptr;
+  T* d_o = nullptr;
+
+  RUNTIME_CHECK(mcMalloc(&d_q, sizeof(T) * q_elems));
+  RUNTIME_CHECK(mcMalloc(&d_k, sizeof(T) * kv_elems));
+  RUNTIME_CHECK(mcMalloc(&d_v, sizeof(T) * kv_elems));
+  RUNTIME_CHECK(mcMalloc(&d_o, sizeof(T) * q_elems));
+
+  RUNTIME_CHECK(mcMemcpy(d_q, h_q.data(), sizeof(T) * q_elems, mcMemcpyHostToDevice));
+  RUNTIME_CHECK(mcMemcpy(d_k, h_k.data(), sizeof(T) * kv_elems, mcMemcpyHostToDevice));
+  RUNTIME_CHECK(mcMemcpy(d_v, h_v.data(), sizeof(T) * kv_elems, mcMemcpyHostToDevice));
+
+  const int threads = 256;
+  const dim3 grid(static_cast<unsigned int>(query_heads),
+                  static_cast<unsigned int>(target_seq_len),
+                  static_cast<unsigned int>(batch_size));
+
+  if constexpr (std::is_same_v<T, float>) {
+    // float uses two-pass softmax for better precision alignment
+    int device = 0;
+    mcDeviceProp_t prop{};
+    RUNTIME_CHECK(mcGetDevice(&device));
+    RUNTIME_CHECK(mcGetDeviceProperties(&prop, device));
+
+    const size_t shmem_d = sizeof(double) * (static_cast<size_t>(threads) + static_cast<size_t>(head_dim));
+    if (shmem_d <= static_cast<size_t>(prop.sharedMemPerBlock)) {
+      const double scale = (head_dim > 0) ? (1.0 / sqrt(static_cast<double>(head_dim))) : 1.0;
+      flashAttentionKernelFloatTwoPassAcc<<<grid, threads, shmem_d>>>(
+          reinterpret_cast<const float*>(d_q), reinterpret_cast<const float*>(d_k),
+          reinterpret_cast<const float*>(d_v), reinterpret_cast<float*>(d_o),
+          batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim,
+          is_causal, scale);
+    } else {
+      const float scale = (head_dim > 0) ? rsqrtf(static_cast<float>(head_dim)) : 1.0f;
+      const size_t shared_bytes = sizeof(float) * (static_cast<size_t>(threads) + static_cast<size_t>(head_dim));
+      flashAttentionKernelFloatTwoPass<<<grid, threads, shared_bytes>>>(
+          reinterpret_cast<const float*>(d_q), reinterpret_cast<const float*>(d_k),
+          reinterpret_cast<const float*>(d_v), reinterpret_cast<float*>(d_o),
+          batch_size, target_seq_len, src_seq_len, query_heads, kv_heads, head_dim,
+          is_causal, scale);
+    }
+  } else {
+    // half uses online softmax with float accumulation
+    const float scale = (head_dim > 0) ? (1.0f / sqrtf(static_cast<float>(head_dim))) : 1.0f;
+    const size_t shared_bytes = sizeof(float) * (static_cast<size_t>(threads) + static_cast<size_t>(head_dim));
+    flashAttentionKernel<T><<<grid, threads, shared_bytes>>>(
+        d_q, d_k, d_v, d_o, batch_size, target_seq_len, src_seq_len,
+        query_heads, kv_heads, head_dim, is_causal, scale);
+  }
+  RUNTIME_CHECK(mcGetLastError());
+  RUNTIME_CHECK(mcDeviceSynchronize());
+
+  RUNTIME_CHECK(mcMemcpy(h_o.data(), d_o, sizeof(T) * q_elems, mcMemcpyDeviceToHost));
+
+  RUNTIME_CHECK(mcFree(d_q));
+  RUNTIME_CHECK(mcFree(d_k));
+  RUNTIME_CHECK(mcFree(d_v));
+  RUNTIME_CHECK(mcFree(d_o));
 }
 
 // *********************************************************************
